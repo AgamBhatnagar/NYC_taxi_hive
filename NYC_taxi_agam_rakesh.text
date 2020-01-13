@@ -1,0 +1,311 @@
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+----creating our working database to create table
+Create database if not exists  agam_nyc;
+----using the created databse to create new table to perform the operations
+use agam_nyc;
+
+----creating new external table for analysis and dropping if already existing in the selected database
+create external table if not exists nyc_taxi_analysis(
+VendorID int,
+passenger_count int,
+trip_distance double,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+tpep_pickup_datetime timestamp,
+tpep_dropoff_datetime timestamp,
+fare_amount double,
+extra double,
+mta_tax double,
+tip_amount double,
+RatecodeID int,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count"="2");
+
+---- Running query to check the data in the created after loding it 
+select * from nyc_taxi_analysis;
+---- external table is visible with the above given command
+
+---- Let's check the number of entries in the created table
+select count(*) from nyc_taxi_analysis;
+---- from the above command we can see that, the created table has 1174568 entries in total.
+
+---- Let's check the number of records of each vendor
+select vendorid,count(*) from nyc_taxi_analysis
+group by vendorid;
+---- from the above command we can see that, Vendor 2 has 647183 entries
+----                                         Vendor 1 has 527385 entries
+
+-----Checking whether the records have pickup month and year other than 2017 & (Nov, Dec)
+select count(*) as num_record from nyc_taxi_analysis 
+where substr(tpep_pickup_datetime, 1, 7) not in('2017-11','2017-12');
+----- from the above command we can see that, there are 14 entries.
+
+---- Let's check each column one by one for data inconsistency
+select count(*) from nyc_taxi_analysis where tpep_pickup_datetime is null;
+-- there are no null values
+
+select count(*) from nyc_taxi_analysis where tpep_dropoff_datetime is null;
+-- there are no null values
+
+select count(*) from nyc_taxi_analysis
+where substr(tpep_pickup_datetime, 1, 7) in('2017-11','2017-12') and passenger_count is null;
+-- there are no null values
+
+select count(*) from nyc_taxi_analysis
+where substr(tpep_pickup_datetime, 1, 7) in('2017-11','2017-12') and trip_distance is null;
+-- there are no null values
+
+select count(*) from nyc_taxi_analysis
+where substr(tpep_pickup_datetime, 1, 7) in('2017-11','2017-12') and fare_amount<= 0;
+-- as per records, there are 870 entries with 0 or negative fare value
+
+select vendorid, count(*) 
+from  nyc_taxi_analysis 
+where ratecodeid=99
+group by vendorid;
+-- vendor-1 has such 8 entries and vendor-2 has only one.
+
+---- Checking for suspicious activity for vendor-1
+select * from  nyc_taxi_analysis 
+where (tpep_dropoff_datetime < '2017-11-1 00:00:00.0' or tpep_dropoff_datetime>='2018-01-02 00:00:00.0')
+and vendorid=1;
+-- There is one in 2019 by vendor 1
+
+---- Checking for suspicious activity for vendor-2
+select * from  nyc_taxi_analysis
+where (tpep_dropoff_datetime < '2017-11-1 00:00:00.0' or tpep_dropoff_datetime>='2018-01-02 00:00:00.0')
+and vendorid=2;
+-- There are total 6 entries. Two are from Oct 2017, 1 from 2009, two fom 2008 and another one from 2003.
+
+---- drop of time greater or equal to pick up time
+select count(*) from nyc_taxi_analysis
+where tpep_dropoff_datetime <= tpep_pickup_datetime;
+-- there are such 6555 entries with such issue
+
+----- RateCodeID for for Nov and Dec in 2017
+select ratecodeid, count(*) from nyc_taxi_analysis
+where substr(tpep_pickup_datetime, 1, 7) in ('2017-11','2017-12')
+group by ratecodeid;
+-- We can see that along with possible ratecodeid(1,2,3,4,5 & 6), we have 99 (count = 9) and surely this is not a valid number
+-- So, this 99 might be the another way of presenting the null values
+
+-----Creating ORC partition table----------------------------------------------
+Create external table if not exists agam_nyc.Orc_nyc(
+passenger_count int,
+vendorid int,
+trip_distance double,
+store_and_fwd_flag string,
+pickup_location int,
+dropoff_location int,
+payment_type int,
+tpep_pickup_timestamp timestamp,
+tpep_dropoff_timestamp timestamp,
+fare_charge double,
+extra_charge double,
+mta_tax_charge double,
+tip_amount double,
+rate_code int,
+tolls_charge double,
+improvement_surcharge double,
+total_amount double
+)
+partitioned by (Mnth int, vendorid int)
+stored as orc location '/user/agam13.93_gmail/agam_nyc'
+tblproperties ("orc.compress"="SNAPPY");
+
+
+-------------inserting data to the Orc_nyc-----------
+------------------------------------------
+-- Following Assumption we are making before creating ORC Partitioned Table
+--- In passenger_count column, we are assuming that 192 and 0 passengers can not be there in one trip, so we will remove such rows
+--- RateCodeID column contains value 99 which is not valid as per data dictionary, we will remove such rows
+--- In trip distance column we are assuming that trip distance can not be zero or negative, so will remove such rows
+--- In improvement surcharge Column, assuming that there should not be any value other than 0.30, removing such rows
+--- In tip amount Column, assuming that there should not be any negative value, removing such rows
+--- In tolls amount Column, assuming that there should not be any negative value, removing such rows
+--- In fare amount column we are assuming that no value should have negative or zero value, we will remove such rows
+--- In Extra Column, assuming that there should not be any negative value, we will remove such rows
+--- In mta_tax Column, assuming that there should not be any value other than 0 or 0.5, removing such rows
+--- In total_amount Column, assuming that there should not be any negative value, removing such rows
+
+------------------------------------------
+-------------inserting limitaions in selecting values for the orc table from the original table----------
+insert overwrite table agam_nyc.Orc_nyc partition(Mnth, vendorid)
+select 
+passenger_count int,
+trip_distance double,
+store_and_fwd_flag string,
+pulocationid int,
+dolocationid int,
+payment_type int,
+tpep_pickup_datetime timestamp,
+tpep_dropoff_datetime timestamp,
+fare_amount double,
+extra double,
+mta_tax double,
+tip_amount double,
+ratecodeid int,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double,
+month(tpep_pickup_datetime) Mnth,
+vendorid int
+from  nyc_taxi_analysis
+where (tpep_pickup_datetime >='2017-11-1 00:00:00.0' and tpep_pickup_datetime < '2018-01-01 00:00:00.0') and
+(tpep_dropoff_datetime >= '2017-11-1 00:00:00.0' and tpep_dropoff_datetime < '2018-01-02 00:00:00.0') and
+(tpep_dropoff_datetime > tpep_pickup_datetime) and
+year(tpep_pickup_datetime) = 2017 and 
+(passenger_count not in (0, 192)) and
+((tip_amount >= 0 and payment_type = 1) or (payment_type != 1 and tip_amount = 0)) and
+(improvement_surcharge in (0, 0.30)) and
+(tolls_amount >= 0) and
+(trip_distance > 0) and 
+(ratecodeid != 99) and
+(fare_amount > 0 ) and
+(extra >= 0) and
+(mta_tax  in (0, 0.5)) and 
+(total_amount > 0) and
+month(tpep_pickup_datetime) in (11,12);
+
+
+--------------- Analysis 1----------------------------
+---- 1.Compare the overall average fare per trip for November and December.
+select round(avg(fare_amount), 2) as avg_charge, round(avg(total_amount),2) as avg_tot_fare, mnth 
+from agam_nyc.Orc_nyc
+group by mnth;
+-----both the avg_fare in Nov and Dec is 13.05 and 12.84 respectively
+-----avg_tot_fare for Nov and Dec are 16.36 & 16.09, respectively
+
+-----2.Explore the ‘number of passengers per trip’
+select passenger_count, round((count(*)*100/1157932), 2) cnt
+from orc_nyc
+group by passenger_count
+order by cnt desc;
+-----passanger_count-------cnt(%)---
+-----------1--------------70.8----------so, solo rides are most common
+-----------2--------------15.17
+-----------5--------------4.69
+-----------3--------------4.35
+
+
+------3.Which is the most preferred mode of payment?
+select payment_type, count(*) as no_trans from orc_nyc
+group by payment_type 
+order by no_trans desc;
+--  payment_type = 1 (credit card) is the most common, with no_trans = 782123
+--  the second prefrred option in payment_type = 2 (cash), no_trans = 369992
+
+
+------4.What is the average tip paid per trip? Compare the average tip with the 25th, 50th and 75th percentiles 
+select round(avg(tip_amount), 2) as avg_tip_per_trip,
+percentile_approx(tip_amount, 0.25) as avg_25_per,  
+percentile_approx(tip_amount, 0.50) as avg_50_per,
+round(percentile_approx(tip_amount, 0.75),3) as avg_75_per
+from orc_nyc;
+------avg_tip_per_trip = 1.85, avg_25_per = 0, avg_50_per = 1.36, avg_75_per = 2.45
+
+
+----   5.Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+select extra, round((count(*)*100/1157932), 4) cnt from 
+(select case 
+when extra > 0 
+then 1 
+else 0 end  extra
+from orc_nyc) tbl
+group by extra
+order by cnt desc;
+------extra---------cnt(%)---
+-------0------------ 53.65
+-------1------------ 46.34
+----So, majority of the cases no extra charge applied
+
+-----Analysis-II-------------------------------------------------------------------
+
+-----1.What is the correlation between the number of passengers on any given trip, 
+--and the tip paid per trip? Do multiple travellers tip more compared to solo travellers? Hint: Use CORR(Col_1, Col_2)
+select corr(passenger_count, tip_amount) as corl
+from orc_nyc;
+-----So, passanger_count and tip_amount are positively correlated with a correlation coefficient of -0.0049
+
+
+-----2.Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20.
+-----Calculate the percentage share of each bucket (i.e. the fraction of trips falling in each bucket).
+select tip_amt_grp, concat(round(count(*) / cast(sum(count(*)) over() as float) *100, 2),'%') 
+as prcnt_of_total from
+(select case
+when tip_amount < 5 then "Between 0 and 5"
+when tip_amount >= 5 and tip_amount < 10 then "Between 5 and 10"
+when tip_amount >= 10 and tip_amount < 15 then "Between 10 and 15"
+when tip_amount >= 15 and tip_amount < 20 then "Between 15 and 20"
+else "Greater than or equal to 20" end as tip_amt_grp 
+from orc_nyc) tbl
+group by tip_amt_grp
+order by tip_amt_grp;
+
+-- Between 0 and 5	92.2%
+--2	Between 10 and 15	1.83%
+--3	Between 15 and 20	0.22%
+--4	Between 5 and 10	5.66%
+--5	Greater than or equal to 20	0.09%
+
+---- 3.Which month has a greater average ‘speed’ - November or December? Note that the variable 
+-----‘speed’ will have to be derived from other metrics. Hint: You have columns for distance and time.
+select mnth, round(avg(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600)), 2) avg_speed
+from orc_nyc
+group by mnth
+order by avg_speed desc;
+-----mnth-----avg_speed---
+------12--------11.1-----
+------11--------11-----
+------Dec is little faster than Nov
+
+------4.Analyse the average speed of the most happening days of the year, i.e. 31st December 
+--(New year’s eve) and 25th December (Christmas) and compare it with the overall average. 
+select is_holiday, round(avg(speed), 2) avg_speed from 
+(select case when ((tpep_pickup_datetime >= '2017-12-25 00:00:00.0' and tpep_pickup_datetime < '2017-12-26 00:00:00.0') 
+or (tpep_pickup_datetime >= '2017-12-31 00:00:00.0' and tpep_pickup_datetime < '2018-01-01 00:00:00.0')) then 1 else 0 end is_holiday, 
+trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600) speed
+from orc_nyc) table1
+group by is_holiday
+order by avg_speed desc;
+--- is_holiday	avg_speed
+-- 	is_holiday	avg_speed
+--1	 1	         14.01
+--2	 0	         10.99
+-- average holiday speed is higher
+------now, lets compare christmas vs new year
+select is_christmas, round(avg(speed), 2) avg_speed from 
+(select case when (tpep_pickup_datetime >= '2017-12-25 00:00:00.0' and tpep_pickup_datetime < '2017-12-26 00:00:00.0') then 1 else 0 end is_christmas, 
+trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600) speed
+from orc_nyc) table2
+group by is_christmas
+order by avg_speed desc;
+
+--  is_christmas	avg_speed
+-- 	is_christmas	avg_speed
+--1	  1	              15.27
+--2	  0	              11.01
+-- average speed n christmas is higher
+
+------during christmas avg_speed is 15.82
+select is_newyear, round(avg(speed), 2) avg_speed from 
+(select case when (tpep_pickup_datetime >= '2017-12-31 00:00:00.0' and tpep_pickup_datetime < '2018-01-01 00:00:00.0') then 1 else 0 end is_newyear, 
+trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600) speed
+from orc_nyc) tbl
+group by is_newyear
+order by avg_speed desc;
+
+-- s_newyear	avg_speed
+-- is_newyear	avg_speed
+--1	1	         13.24
+--2	0	         11.02
+-- average speed on new year is higher.
